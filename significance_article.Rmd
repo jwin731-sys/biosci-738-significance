@@ -1,0 +1,613 @@
+---
+title: "The Fallen Tōtara"
+output:
+  html_document:
+    self_contained: true
+    css: significance.css
+    number_sections: false
+    toc: false
+    theme: null
+    highlight: null
+    template: null
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo    = FALSE,
+  message = FALSE,
+  warning = FALSE
+)
+library(here)
+knitr::opts_knit$set(root.dir = here::here())
+```
+
+```{r libs-and-data, include=FALSE, cache=FALSE}
+# ── Packages ──────────────────────────────────────────────────────────────────
+# httr/jsonlite: iNaturalist API v1 calls
+# ggplot2/patchwork: figures
+# dplyr/tidyr: data wrangling
+# scales: formatted axis labels (comma(), percent())
+# lubridate: timezone-aware datetime for bioblitz 5-min bins
+library(httr)
+library(jsonlite)
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(scales)
+library(patchwork)
+library(lubridate)
+
+# ── Key dates ─────────────────────────────────────────────────────────────────
+bioblitz_date  <- as.Date("2026-03-24")   # UoA City Campus bioblitz
+thorpe_death   <- as.Date("2024-08-01")   # approximate (no public exact date)
+
+# ── Colour scheme ─────────────────────────────────────────────────────────────
+# Three "devoted superuser" projects get distinct hues; comparison projects use grey
+ua_palette <- c(
+  "UoA Campus"         = "#1A5276",
+  "Dye Creek"          = "#27AE60",
+  "ArkState Querétaro" = "#8E44AD"
+)
+normal_colour      <- "#7F8C8D"
+user_agent_string  <- "BIOSCI738-significance-article (R; educational use)"
+api_base           <- "https://api.inaturalist.org/v1"
+
+# ── API helper: fetch observer rank-abundance for a project ───────────────────
+# Returns a data frame: rank (1 = top observer), user_login, obs_count.
+# The iNat /observations/observers endpoint returns results ordered by
+# observation count descending; there is no explicit rank field, so rank is
+# derived from row position (1-indexed).
+# cache=TRUE in the calling chunk means this runs once per project then is
+# stored; polite 0.5-second sleep avoids hammering the API.
+get_project_observers <- function(project_id, max_results = 500) {
+  empty_df <- data.frame(rank=integer(), user_login=character(),
+                          obs_count=integer(), stringsAsFactors=FALSE)
+  resp <- tryCatch(
+    GET(url   = paste0(api_base, "/observations/observers"),
+        query = list(project_id=project_id, per_page=max_results),
+        timeout(30), user_agent(user_agent_string)),
+    error = function(e) { warning(sprintf("GET observers failed for %s: %s", project_id, e$message)); NULL }
+  )
+  Sys.sleep(0.5)
+  if (is.null(resp) || http_error(resp)) return(empty_df)
+  # simplifyVector=TRUE makes $results a data frame with a nested $user data frame
+  parsed <- tryCatch(fromJSON(rawToChar(resp$content), simplifyVector=TRUE),
+                     error = function(e) NULL)
+  res <- parsed$results
+  if (is.null(res) || !is.data.frame(res) || nrow(res) == 0) return(empty_df)
+  data.frame(
+    rank       = seq_len(nrow(res)),
+    user_login = res$user$login,
+    obs_count  = as.integer(res$observation_count),
+    stringsAsFactors = FALSE
+  )
+}
+
+# ── API helper: paginated annual observation counts for one user in one project ─
+# Paginates through all observations (200/page) to get a complete year breakdown.
+# Needed because the /observations endpoint caps per_page at 200 and some
+# devoted observers have 1000+ observations — a single-page fetch would
+# silently truncate their recent-year counts.
+get_user_annual_obs <- function(project_id, user_login) {
+  empty_df <- data.frame(year=integer(), n_obs=integer(), stringsAsFactors=FALSE)
+  all_years <- integer(0)
+  page <- 1L
+  repeat {
+    resp <- tryCatch(
+      GET(url   = paste0(api_base, "/observations"),
+          query = list(project_id=project_id, user_id=user_login,
+                       per_page=200, page=page, order="asc", order_by="observed_on"),
+          timeout(30), user_agent(user_agent_string)),
+      error = function(e) NULL
+    )
+    Sys.sleep(0.4)
+    if (is.null(resp) || http_error(resp)) break
+    parsed <- tryCatch(fromJSON(rawToChar(resp$content), simplifyVector=TRUE),
+                       error = function(e) NULL)
+    res <- parsed$results
+    if (is.null(res) || !is.data.frame(res) || nrow(res) == 0) break
+    yrs <- suppressWarnings(as.integer(substr(res$observed_on, 1, 4)))
+    all_years <- c(all_years, yrs[!is.na(yrs)])
+    if (nrow(res) < 200L) break   # reached last page
+    page <- page + 1L
+    if (page > 25L) break          # safety cap: handles up to ~5000 observations
+  }
+  if (length(all_years) == 0) return(empty_df)
+  as.data.frame(table(year = all_years), stringsAsFactors=FALSE) %>%
+    rename(n_obs = Freq) %>%
+    mutate(year = as.integer(as.character(year)))
+}
+
+`%||%` <- function(a, b) if (!is.null(a)) a else b
+
+# ── Power-law fit to observer rank-abundance ───────────────────────────────────
+# Fits log(obs_count) ~ log(rank) to ranks 2..20 (excluding rank 1 deliberately:
+# we want to predict what a "normal" rank-1 contributor would look like under the
+# community distribution, then measure how far the actual rank-1 deviates from
+# that expectation — the "excess" statistic).
+fit_power_law <- function(df) {
+  if (is.null(df) || nrow(df)==0 || !all(c("rank","obs_count") %in% names(df)))
+    return(list(slope=NA_real_, intercept=NA_real_))
+  usable <- df %>%
+    filter(rank >= 2, rank <= min(20L, max(rank, na.rm=TRUE)), obs_count > 0) %>%
+    filter(is.finite(rank), is.finite(obs_count))
+  if (nrow(usable) < 2) return(list(slope=NA_real_, intercept=NA_real_))
+  fit <- tryCatch(lm(log(obs_count) ~ log(rank), data=usable), error=function(e) NULL)
+  if (is.null(fit)) return(list(slope=NA_real_, intercept=NA_real_))
+  coefs <- coef(fit)
+  list(slope=unname(coefs[[2]]), intercept=unname(coefs[[1]]))
+}
+
+obs_csv <- read.csv("data/clean/observations_flat.csv", stringsAsFactors=FALSE)
+obs_csv$observed_on_date <- as.Date(obs_csv$observed_on, format="%Y-%m-%d")
+
+total_uoa_obs <- nrow(obs_csv)
+observer_ranking <- obs_csv %>%
+  filter(!is.na(user_login), nzchar(user_login)) %>%
+  count(user_login, name="obs_count") %>%
+  arrange(desc(obs_count), user_login) %>%
+  mutate(total_obs = total_uoa_obs)
+
+bioblitz_df <- obs_csv %>% filter(!is.na(observed_on_date), observed_on_date == bioblitz_date)
+
+thorpe_annual <- obs_csv %>%
+  filter(user_login == "stephen_thorpe") %>%
+  mutate(year = suppressWarnings(as.integer(format(observed_on_date, "%Y")))) %>%
+  filter(!is.na(year)) %>%
+  count(year, name="n_obs") %>%
+  arrange(year)
+
+first_taxon_dates <- obs_csv %>%
+  filter(!is.na(taxon_name), nzchar(taxon_name), !is.na(observed_on_date)) %>%
+  group_by(taxon_name) %>%
+  summarise(first_observed_on = min(observed_on_date), .groups="drop") %>%
+  mutate(first_on_bioblitz = first_observed_on == bioblitz_date)
+new_species_count <- sum(first_taxon_dates$first_on_bioblitz, na.rm=TRUE)
+```
+
+```{r cross-project-api, include=FALSE, cache=TRUE}
+## Sections 3–4: cross-project API pull + bioblitz timing
+## cache=TRUE so API calls don't rerun on every knit
+
+projects <- list(
+  "UoA Campus"         = list(id=24826, r1="stephen_thorpe",    type="thorpe"),
+  "Dye Creek"          = list(id=32783, r1="dyecreekscott",     type="thorpe"),
+  "ArkState Querétaro" = list(id=27346, r1="shady_meerkat",     type="thorpe"),
+  "Georgia Tech"       = list(id=25859, r1="featherenthusiast", type="normal"),
+  "West Valley"        = list(id=17602, r1="merav",             type="normal"),
+  "Univ. Alabama"      = list(id=6339,  r1="jdorris54",         type="normal")
+)
+project_names <- names(projects)
+
+all_observer_list   <- vector("list", length(projects))
+project_metrics_list <- vector("list", length(projects))
+
+for (i in seq_along(projects)) {
+  project_name <- project_names[[i]]
+  project_info <- projects[[i]]
+
+  if (project_name == "UoA Campus") {
+    observers_df <- observer_ranking %>%
+      mutate(rank = row_number()) %>%
+      select(rank, user_login, obs_count, total_obs)
+  } else {
+    api_rank_df     <- get_project_observers(project_info$id, max_results=500)
+    total_obs_project <- sum(api_rank_df$obs_count, na.rm=TRUE)
+    observers_df <- if (nrow(api_rank_df)==0) {
+      data.frame(rank=integer(), user_login=character(),
+                 obs_count=integer(), total_obs=numeric(), stringsAsFactors=FALSE)
+    } else {
+      api_rank_df %>% mutate(total_obs=total_obs_project)
+    }
+  }
+
+  observers_df <- observers_df %>%
+    mutate(project=project_name, type=project_info$type) %>%
+    select(project, type, rank, user_login, obs_count, total_obs)
+  all_observer_list[[i]] <- observers_df
+
+  total_obs_value <- if (nrow(observers_df)==0) 0 else max(observers_df$total_obs, na.rm=TRUE)
+  r1_row <- observers_df %>% filter(rank==1)
+  r2_row <- observers_df %>% filter(rank==2)
+  r1_n   <- if (nrow(r1_row)==0) NA_real_ else as.numeric(r1_row$obs_count[[1]])
+  r2_n   <- if (nrow(r2_row)==0) NA_real_ else as.numeric(r2_row$obs_count[[1]])
+  fit    <- fit_power_law(observers_df)
+  predicted_r1 <- if (is.na(fit$intercept)) NA_real_ else exp(fit$intercept)
+
+  project_metrics_list[[i]] <- data.frame(
+    project=project_name, type=project_info$type, r1_user=project_info$r1,
+    r1_n=r1_n, r2_n=r2_n, total_obs=total_obs_value,
+    r1r2_ratio  = if (is.na(r1_n)||is.na(r2_n)||r2_n==0) NA_real_ else r1_n/r2_n,
+    pct_r1      = if (is.na(r1_n)||total_obs_value==0) NA_real_ else r1_n/total_obs_value,
+    power_law_slope=fit$slope, power_law_intercept=fit$intercept,
+    predicted_r1=predicted_r1,
+    excess = if (is.na(r1_n)||is.na(predicted_r1)||predicted_r1<=0) NA_real_ else r1_n/predicted_r1,
+    stringsAsFactors=FALSE
+  )
+}
+
+annual_list <- list(
+  thorpe_annual %>% mutate(project="UoA Campus", user_login="stephen_thorpe"),
+  get_user_annual_obs(projects[["Dye Creek"]]$id, "dyecreekscott") %>%
+    mutate(project="Dye Creek", user_login="dyecreekscott"),
+  get_user_annual_obs(projects[["ArkState Querétaro"]]$id, "shady_meerkat") %>%
+    mutate(project="ArkState Querétaro", user_login="shady_meerkat")
+)
+
+all_observers_df <- bind_rows(all_observer_list)
+project_metrics  <- bind_rows(project_metrics_list) %>%
+  mutate(
+    project_short = c("UoA","Dye","ArkState","GaTech","West Valley","Alabama")[
+      match(project, project_names)],
+    plot_colour = if_else(type=="thorpe", ua_palette[project], normal_colour)
+  )
+all_observers_df <- all_observers_df %>%
+  left_join(project_metrics %>%
+    select(project, power_law_slope, power_law_intercept, predicted_r1,
+           excess, pct_r1, r1r2_ratio, plot_colour),
+    by="project")
+annual_df <- bind_rows(annual_list) %>%
+  select(project, user_login, year, n_obs) %>%
+  mutate(project = factor(project, levels=c("UoA Campus","Dye Creek","ArkState Querétaro")),
+         plot_colour = ua_palette[as.character(project)])
+
+blitz_5min <- bioblitz_df %>%
+  mutate(time_utc = suppressWarnings(ymd_hms(time_observed_at, tz="UTC", quiet=TRUE))) %>%
+  filter(!is.na(time_utc)) %>%
+  mutate(time_nz = with_tz(time_utc, tzone="Pacific/Auckland"),
+         bin = floor_date(time_nz, unit="5 minutes")) %>%
+  count(bin, name="n") %>%
+  arrange(bin)
+```
+
+```{r build-figures, include=FALSE}
+## Sections 5–8: build all four figure objects (no output here)
+
+# Figure A
+figA_panels <- lapply(project_names, function(pn) {
+  df_p  <- all_observers_df %>% filter(project==pn)
+  m_p   <- project_metrics %>% filter(project==pn)
+  col   <- if (nrow(m_p)==0) normal_colour else m_p$plot_colour[[1]]
+  pfx   <- if (nrow(m_p)>0 && identical(m_p$type[[1]],"thorpe")) "★ " else ""
+  line_df <- if (nrow(df_p)==0||nrow(m_p)==0||is.na(m_p$power_law_intercept[[1]])) {
+    data.frame(rank=numeric(), obs_count=numeric())
+  } else {
+    data.frame(rank=seq(1,max(df_p$rank,na.rm=TRUE)),
+               obs_count=exp(m_p$power_law_intercept[[1]])*
+                 seq(1,max(df_p$rank,na.rm=TRUE))^m_p$power_law_slope[[1]])
+  }
+  pred_df <- if (nrow(m_p)==0||is.na(m_p$predicted_r1[[1]])) {
+    data.frame(rank=numeric(), obs_count=numeric())
+  } else {
+    data.frame(rank=1, obs_count=m_p$predicted_r1[[1]])
+  }
+  annot <- if (nrow(m_p)==0) "R1/R2: NA\nExcess: NA" else
+    sprintf("R1/R2: %s\nExcess: %s\nR1: %s",
+      ifelse(is.na(m_p$r1r2_ratio[[1]]),"NA",number(m_p$r1r2_ratio[[1]],accuracy=0.1,suffix="x")),
+      ifelse(is.na(m_p$excess[[1]]),"NA",number(m_p$excess[[1]],accuracy=0.1,suffix="x")),
+      ifelse(is.na(m_p$pct_r1[[1]]),"NA",percent(m_p$pct_r1[[1]],accuracy=0.1)))
+  ggplot(df_p, aes(rank, obs_count)) +
+    geom_point(color=col, size=1, alpha=0.5, na.rm=TRUE) +
+    geom_point(data=df_p%>%filter(rank==1), shape=21, stroke=0.7,
+               fill=col, color="black", size=3, na.rm=TRUE) +
+    geom_line(data=line_df, aes(rank,obs_count), inherit.aes=FALSE,
+              linewidth=0.4, linetype="dashed", color="black", na.rm=TRUE) +
+    geom_point(data=pred_df, aes(rank,obs_count), inherit.aes=FALSE,
+               shape=24, size=2.5, fill="white", color="black", stroke=0.7, na.rm=TRUE) +
+    scale_x_log10(labels=label_number()) + scale_y_log10(labels=label_number()) +
+    labs(title=paste0(pfx,pn), x=NULL, y=NULL) +
+    annotate("text",x=Inf,y=Inf,label=annot,hjust=1.05,vjust=1.1,size=3) +
+    theme_bw() +
+    theme(panel.grid.minor=element_blank(),
+          panel.grid.major=element_line(colour="grey90",linewidth=0.2),
+          plot.title=element_text(size=11,face="bold"), axis.text=element_text(size=8))
+})
+figA <- wrap_plots(figA_panels, ncol=3) +
+  plot_annotation(title="Observer rank-abundance across six iNaturalist projects",
+                  theme=theme_bw()) & labs(x="Observer rank", y="Observations")
+
+# Figure B — uniform x and y axes across all three superuser panels
+figure_b_titles <- c("UoA Campus"="stephen_thorpe | UoA Campus",
+                     "Dye Creek"="dyecreekscott | Dye Creek",
+                     "ArkState Querétaro"="shady_meerkat | ArkState Querétaro")
+figB_projects <- c("UoA Campus","Dye Creek","ArkState Querétaro")
+# Shared y ceiling: highest single-year count across all three observers
+figB_ymax <- max(annual_df$n_obs[as.character(annual_df$project) %in% figB_projects],
+                 na.rm=TRUE) * 1.1   # 10% headroom for the total label
+figB_panels <- lapply(figB_projects, function(pn) {
+  df_p  <- annual_df %>% filter(as.character(project)==pn)
+  col   <- ua_palette[[pn]]
+  login <- if (nrow(df_p)==0) projects[[pn]]$r1 else df_p$user_login[[1]]
+  pm_row <- project_metrics %>% filter(project==pn)
+  true_total <- if (nrow(pm_row)>0) pm_row$r1_n[[1]] else sum(df_p$n_obs, na.rm=TRUE)
+  total_lbl <- sprintf("Total: %s", comma(true_total))
+  last_yr <- if (login %in% c("stephen_thorpe","shady_meerkat") && nrow(df_p)>0)
+    max(df_p$year[df_p$year <= 2025], na.rm=TRUE) else NA_integer_
+  p <- ggplot(df_p, aes(year, n_obs)) +
+    geom_col(fill=col, width=0.8, na.rm=TRUE) +
+    # coord_cartesian zooms without dropping data (bars at 2025 stay intact)
+    scale_x_continuous(breaks=seq(2010,2025,by=3)) +
+    coord_cartesian(xlim=c(2009.5, 2025.5), ylim=c(0, figB_ymax)) +
+    labs(title=figure_b_titles[[pn]], x="Year", y="Observations") +
+    annotate("text",x=2025.5,y=figB_ymax,label=total_lbl,hjust=1,vjust=1.3,size=3.2) +
+    theme_bw() +
+    theme(panel.grid.minor=element_blank(), panel.grid.major.x=element_blank(),
+          plot.title=element_text(size=11,face="bold"),
+          axis.text.x=element_text(angle=45, hjust=1, size=8))
+  if (!is.na(last_yr))
+    p <- p + geom_vline(xintercept=last_yr+0.5, color="red3", linetype="dashed", linewidth=0.5) +
+      annotate("text",x=last_yr+0.4,y=figB_ymax*0.82,label="Last\nobs",
+               color="red3",vjust=0,hjust=1,size=2.8)
+  p
+})
+figB <- wrap_plots(figB_panels, ncol=3) +
+  plot_annotation(title="Annual contributions of devoted single observers",
+                  theme=theme_bw())
+
+# Figure C
+metrics_long <- project_metrics %>%
+  select(project, project_short, type, plot_colour, r1r2_ratio, excess, pct_r1) %>%
+  pivot_longer(cols=c(r1r2_ratio,excess,pct_r1), names_to="metric", values_to="value")
+metric_labels <- c(r1r2_ratio="R1/R2 ratio",
+                   excess="Observed vs predicted rank-1 excess",
+                   pct_r1="Share of project observations from rank-1 observer")
+make_metric_plot <- function(mn) {
+  df_m <- metrics_long %>% filter(metric==mn)
+  vlab <- if (mn=="pct_r1") percent(df_m$value,accuracy=0.1) else number(df_m$value,accuracy=0.1)
+  ggplot(df_m, aes(factor(project_short,levels=project_metrics$project_short), value, fill=project)) +
+    geom_col(width=0.75, na.rm=TRUE) +
+    geom_text(aes(label=vlab), vjust=-0.3, size=3, na.rm=TRUE) +
+    scale_fill_manual(values=setNames(project_metrics$plot_colour,project_metrics$project),
+                      guide=guide_legend(title=NULL)) +
+    labs(title=metric_labels[[mn]], x=NULL, y=NULL) +
+    theme_bw() +
+    theme(panel.grid.minor=element_blank(), panel.grid.major.x=element_blank(),
+          plot.title=element_text(size=10,face="bold"),
+          axis.text.x=element_text(angle=30,hjust=1), legend.position="bottom")
+}
+figC <- (make_metric_plot("r1r2_ratio") + geom_hline(yintercept=1,linetype="dashed",linewidth=0.4) |
+         make_metric_plot("excess")     + geom_hline(yintercept=1,linetype="dashed",linewidth=0.4) |
+         make_metric_plot("pct_r1")     + scale_y_continuous(labels=percent_format(accuracy=1))) +
+  plot_layout(guides="collect") & theme(legend.position="bottom")
+
+# Figure D
+accum_all <- obs_csv %>%
+  filter(!is.na(observed_on_date), !is.na(taxon_name), nzchar(taxon_name)) %>%
+  arrange(observed_on_date, id) %>%
+  mutate(observation_number=row_number(), cumulative_taxa=cumsum(!duplicated(taxon_name))) %>%
+  select(observation_number, observed_on_date, cumulative_taxa)
+accum_no_thorpe <- obs_csv %>%
+  filter(user_login!="stephen_thorpe", !is.na(observed_on_date),
+         !is.na(taxon_name), nzchar(taxon_name)) %>%
+  arrange(observed_on_date, id) %>%
+  mutate(observation_number=row_number(), cumulative_taxa=cumsum(!duplicated(taxon_name))) %>%
+  select(observation_number, observed_on_date, cumulative_taxa)
+accum_long <- bind_rows(accum_all %>% mutate(series="All observers"),
+                        accum_no_thorpe %>% mutate(series="Excluding stephen_thorpe"))
+final_taxa_all      <- max(accum_all$cumulative_taxa, na.rm=TRUE)
+final_taxa_no_thorpe <- max(accum_no_thorpe$cumulative_taxa, na.rm=TRUE)
+thorpe_exclusive_taxa <- final_taxa_all - final_taxa_no_thorpe
+
+no_thorpe_by_date <- accum_no_thorpe %>%
+  group_by(observed_on_date) %>%
+  summarise(taxa_no_thorpe=max(cumulative_taxa), .groups="drop") %>%
+  arrange(observed_on_date)
+ribbon_df <- accum_all %>%
+  rename(taxa_all=cumulative_taxa) %>%
+  mutate(taxa_no_thorpe = {
+    idx <- findInterval(observed_on_date, no_thorpe_by_date$observed_on_date)
+    ifelse(idx==0, 0, no_thorpe_by_date$taxa_no_thorpe[pmax(idx,1)])
+  }) %>%
+  select(observation_number, taxa_all, taxa_no_thorpe)
+
+thorpe_death_x <- if (any(accum_all$observed_on_date <= thorpe_death))
+  max(accum_all$observation_number[accum_all$observed_on_date <= thorpe_death], na.rm=TRUE) else NA_real_
+bioblitz_x <- if (any(accum_all$observed_on_date <= bioblitz_date))
+  max(accum_all$observation_number[accum_all$observed_on_date <= bioblitz_date], na.rm=TRUE) else NA_real_
+
+figD <- ggplot() +
+  geom_ribbon(data=ribbon_df, aes(x=observation_number,ymin=taxa_no_thorpe,ymax=taxa_all),
+              fill=ua_palette[["UoA Campus"]], alpha=0.15, na.rm=TRUE) +
+  geom_line(data=accum_long, aes(x=observation_number,y=cumulative_taxa,color=series),
+            linewidth=0.8, na.rm=TRUE) +
+  scale_color_manual(values=c("All observers"=ua_palette[["UoA Campus"]],
+                               "Excluding stephen_thorpe"=normal_colour), name=NULL) +
+  labs(title="UoA Campus species accumulation with and without Stephen Thorpe",
+       x="Observation number", y="Cumulative taxa") +
+  theme_bw() + theme(panel.grid.minor=element_blank(), legend.position="bottom")
+if (!is.na(thorpe_death_x))
+  figD <- figD + geom_vline(xintercept=thorpe_death_x, linetype="dashed", color="red3", linewidth=0.5) +
+    annotate("text",x=thorpe_death_x,y=Inf,label="Thorpe's death",color="red3",
+             vjust=-0.3,hjust=-0.05,size=3,angle=90)
+if (!is.na(bioblitz_x))
+  figD <- figD + geom_vline(xintercept=bioblitz_x, linetype="dashed", color="dodgerblue4", linewidth=0.5) +
+    annotate("text",x=bioblitz_x,y=Inf,label="Bioblitz",color="dodgerblue4",
+             vjust=-0.3,hjust=-0.05,size=3,angle=90)
+figD <- figD +
+  annotate("text", x=max(accum_all$observation_number,na.rm=TRUE), y=final_taxa_all,
+           label=sprintf("Thorpe-exclusive taxa: %s", comma(thorpe_exclusive_taxa)),
+           hjust=1.05, vjust=-0.3, size=3.2)
+```
+
+<!-- ══════════════════════════════════════════════════════ -->
+<!-- ARTICLE LAYOUT STARTS HERE — raw HTML for structure   -->
+<!-- ══════════════════════════════════════════════════════ -->
+
+<div class="sig-masthead">Significance &nbsp;·&nbsp; Features &nbsp;·&nbsp; Citizen Science</div>
+
+<div class="sig-hero">
+<img src="https://inaturalist-open-data.s3.amazonaws.com/photos/422526180/large.jpeg"
+     alt="Xenocnema spinipes — Stephen Thorpe's last observation, 23 August 2024">
+<div class="sig-hero-text">
+<div class="sig-kicker">University of Auckland City Campus · iNaturalist · 2010–2024</div>
+<div class="sig-title">The Fallen Tōtara</div>
+<p class="sig-standfirst">One person's 14-year contribution to a citizen science project reveals how biodiversity data are made — and what is lost when the maker goes silent.</p>
+</div>
+</div>
+
+<div class="sig-body">
+
+<!-- PROFILE SIDEBAR -->
+<div class="sidebar-box">
+<h4>Stephen Thorpe</h4>
+<img class="profile-photo"
+     src="https://static.inaturalist.org/attachments/users/icons/15329/medium.jpeg"
+     alt="@stephen_thorpe">
+<div class="profile-name">@stephen_thorpe</div>
+<div class="profile-dates">iNaturalist · 2010–2024</div>
+<hr class="stat-divider">
+<div class="stat-section-label">UoA Campus Project</div>
+<div class="stat-row"><span class="stat-num">2,053</span><span class="stat-label">observations (36% of all project records)</span></div>
+<div class="stat-row"><span class="stat-num">14</span><span class="stat-label">years continuous monitoring</span></div>
+<hr class="stat-divider">
+<div class="stat-section-label">Global Record</div>
+<div class="stat-row"><span class="stat-num">28,807</span><span class="stat-label">total observations</span></div>
+<div class="stat-row"><span class="stat-num">92,543</span><span class="stat-label">identifications for others</span></div>
+<div class="stat-row"><span class="stat-num">5,333</span><span class="stat-label">species observed</span></div>
+<hr class="stat-divider">
+<div class="stat-section-label">Final Observation · Tribute</div>
+<div class="tribute-header">♥ × 125 &nbsp; 💬 × 85</div>
+</div>
+
+<p class="drop-cap">On 23 August 2024 at 2:44 pm, Stephen Thorpe photographed a beetle in Auckland. The species was *Xenocnema spinipes*, the shortnosed kauri weevil — not a flashy discovery, but recorded with the same methodical care Thorpe applied to everything. He posted it to iNaturalist at 3:51 pm. It was observation number 2,053 he had contributed to the University of Auckland City Campus project. It was his last.</p>
+
+Within 48 hours, the community had noticed his absence. Comments appeared on that final photograph — first a worried handful, then dozens. Within a week, 85 people had left messages and 125 had marked it with a digital heart. "One of the largest losses to the iNaturalist, entomology and ecology field to date," wrote user \@naturewu. "Not just in New Zealand but in the whole world."
+
+The grief was real and immediate. But it was also, in a strange way, legible — because the data record was precise. We know exactly when Thorpe stopped. We know what he had accumulated across 14 years of systematic observation. By analysing his project alongside comparable ones, and by comparing his long-term record against a burst of intensive surveying that followed his death, it becomes possible to say something specific about what citizen science data actually is, how it is generated, and how fragile it can be.
+
+## What the data-generating process looks like
+
+iNaturalist works like this: anyone with a phone can photograph an organism, upload it, and either identify it themselves or submit it for identification by others. The platform records not just the species but the observer, the date, the time, and — with user consent — the precise location. Those records aggregate into projects. The University of Auckland City Campus project, running since 2010, had accumulated 5,689 observations from 594 unique observers spanning 1,982 distinct taxa by the time of this analysis.
+
+That sounds like a collective enterprise, and in one sense it is. But "594 observers" conceals enormous heterogeneity in how those observations were produced — what ecologists call the data-generating process, or DGP. It is not just the biological fact that species exist on campus. It is the cascade of human decisions, behaviours, and infrastructures that transform biological presence into a data record: who goes out, how often, what they look for, how carefully they identify what they find.
+
+The observer distribution in any bounded-site iNaturalist project tends to follow a power law: a small number of contributors produce a disproportionate share of the total. To explore whether Thorpe was unusual even within this already-skewed distribution, the same analysis was applied to six other bounded-site iNaturalist projects of comparable scale — campus nature reserves and managed preserves with observation totals between 3,400 and 12,200 records. The result sorted the seven projects cleanly into two groups.
+
+## Two kinds of project, three kinds of devoted observer
+
+<!-- GLOSSARY SIDEBAR -->
+<div class="sidebar-box">
+<h4>Key concepts</h4>
+<div class="term"><strong>Power law</strong><span>A distribution where a small fraction of participants produce most output. Common in online communities, citation networks, and citizen science.</span></div>
+<div class="term"><strong>Power-law excess</strong><span>Ratio of actual rank-1 count to the count a power-law fit through ranks 2–20 would predict. Values above 1 indicate a top contributor beyond what the rest of the community's distribution implies.</span></div>
+<div class="term"><strong>Superuser</strong><span>A small fraction of iNaturalist contributors responsible for a disproportionately large share of observations and identifications (Di Cecco et al. 2021).</span></div>
+<div class="term"><strong>Research grade</strong><span>iNat quality tier assigned when ≥2/3 of identifiers agree. Records flow to GBIF and support scientific analyses.</span></div>
+<div class="term"><strong>Bioblitz</strong><span>An intensive, time-bounded biodiversity survey — many observers, short window, deliberately broad.</span></div>
+</div>
+
+In three of the six projects, the rank-1 contributor sits at or below where the power law predicts — their top observer is simply a slightly larger version of rank 2. The mean ratio of rank-1 to rank-2 observations in these "typical" projects is 1.5×, and the top observer accounts for about 8.4% of all records. The power law describes the whole distribution, including the top.
+
+In the remaining three — UoA Campus, Dye Creek Preserve in California, and an Arkansas State University campus in Querétaro, Mexico — rank-1 does not sit on the curve. It sits far above it. These projects share a structural signature: R1/R2 greater than 5× and a power-law excess greater than 4×. Thorpe's R1/R2 ratio is 9.5×; his excess is 5.1×. In the typical four projects, excess averages 0.7× — the top contributor actually falls *below* the power-law expectation.
+
+| Project | R1/R2 | Power-law excess | % of project obs |
+|:---|:---:|:---:|:---:|
+| **UoA Campus (stephen_thorpe)** | **9.5×** | **5.1×** | **35.4%** |
+| **Dye Creek Preserve (dyecreekscott)** | **5.8×** | **6.3×** | **35.9%** |
+| **ArkState Querétaro (shady_meerkat)** | **6.1×** | **4.2×** | **10.7%** |
+| Typical projects (mean of 3) | 1.5× | 0.7× | 8.4% |
+
+The three outlier projects share the statistical signature, but their trajectories differ. Thorpe's contribution to UoA built steadily across 15 years, peaked at 314 observations in 2023, then stopped abruptly in August 2024. dyecreekscott at Dye Creek Preserve looks like what a living Thorpe would: still accelerating, 2025 his most productive year at 438 observations, still active as of mid-2026. shady_meerkat at ArkState Querétaro represents a third pattern — high intensity and low durability, with 372 observations in a single year (2021) followed by rapid decline and cessation in 2024. Sustained-and-terminated. Sustained-and-ongoing. Intense-and-brief.
+
+```{r figA, fig.width=12, fig.height=8, fig.cap="**Figure A.** Observer rank-abundance across six bounded-site iNaturalist projects (log–log axes). Each point is one observer. Dashed line: power-law fit to ranks 2–20. ▲ = expected rank-1 count from the power law. <span style='font-size:1.1em; color:#1A5276'>●</span><span style='font-size:1.1em; color:#27AE60'>●</span><span style='font-size:1.1em; color:#8E44AD'>●</span> coloured large dot = rank-1 observer in a ★ superuser project (UoA, Dye Creek, ArkState Querétaro). <span style='font-size:1.1em; color:#7F8C8D'>●</span> grey = comparison project rank-1. All three superuser projects show a rank-1 observation count well above the power-law baseline; the grey comparison projects do not."}
+figA
+```
+
+```{r figB, fig.width=12, fig.height=5, fig.cap="**Figure B.** Annual observations by the rank-1 contributor in the three bounded-site iNaturalist projects where a single observer dominates. All panels share the same 2010–2025 x-axis; the shared scale makes the contrasting careers visible at a glance. Red dashed line = last recorded observation: stephen_thorpe (UoA Campus) and shady_meerkat (ArkState Querétaro, Mexico) both stopped in 2024; dyecreekscott (Dye Creek Preserve, California) was still active at the time of writing."}
+figB
+```
+
+## Not just observing — curating
+
+<!-- OBS PHOTO SIDEBAR -->
+<div class="sidebar-box">
+<h4>Last observation · 23 Aug 2024</h4>
+<img src="https://inaturalist-open-data.s3.amazonaws.com/photos/422526180/large.jpeg"
+     alt="Xenocnema spinipes — Thorpe's final iNaturalist observation">
+<p style="font-size:11px; color:#666; margin-top:5px; font-style:italic;">
+<em>Xenocnema spinipes</em> (shortnosed kauri weevil), photographed 23 August 2024 at 14:44. Posted to iNaturalist at 15:51. Observation 237414880. Photo © Stephen Thorpe, CC BY.</p>
+</div>
+
+Thorpe's structural exceptionality extended beyond observation counts. iNaturalist has a quality tier called "research grade," assigned when an observation meets identification standards and at least two-thirds of identifiers agree on the species. Research-grade records flow into global biodiversity databases, species distribution models, and conservation assessments.
+
+Thorpe was not only the most prolific observer in the UoA project — he was its most active identifier of others' records. His identifications were disproportionately "improving" (29.7%) and "leading" (21.9%) — meaning he frequently refined the community taxon to species level or seeded new identifications from scratch, rather than merely agreeing with an existing consensus. This is the identification behaviour that pushes records across the research-grade threshold.
+
+Species accumulation curves make the scale of his contribution concrete. Removing Thorpe's observations from the dataset reduces the project's cumulative taxa count by `r thorpe_exclusive_taxa` species — taxa first recorded by him that no other observer detected in 14 years of community effort.
+
+```{r figD, fig.width=12, fig.height=6, fig.cap="**Figure D.** Cumulative taxon accumulation for the iNaturalist *Biota of University of Auckland City Campus* project (5,689 observations, 2015–2026). Blue = all 594 observers; grey = same dataset with Stephen Thorpe's 2,053 records removed. The shaded band is the 'Thorpe shadow' — taxa recorded only through his contribution. Red dashed line: Thorpe's death (August 2024). Blue dashed line: March 2026 bioblitz event."}
+figD
+```
+
+This is not an indictment of the other 593 observers. It is a description of how citizen science functions in practice. The pipeline from "someone photographed a weevil" to "a usable biodiversity record" requires identification, and identification requires expertise. Expertise concentrates. The consequence is that the scientific value of a citizen science project is not evenly distributed across its participants — it pools around individuals who bring specialist knowledge to a platform where most users are generalists.
+
+```{r figC, fig.width=12, fig.height=5, fig.cap="**Figure C.** Three observer-concentration metrics across the six iNaturalist bounded-site citizen-science projects analysed. R1/R2: ratio of the top observer's count to the second observer's count. Power-law excess: observed rank-1 count divided by the count predicted by fitting a power law to ranks 2–20 (excess > 1 means the top observer exceeds the trend). % rank-1: fraction of all project observations contributed by the top observer. Dashed reference lines at ratio = 1 and excess = 1 mark the null expectation. Coloured bars = three 'devoted superuser' projects; grey bars = three typical projects."}
+figC
+```
+
+## A different kind of arrival: the bioblitz
+
+The UoA City Campus project has hosted coordinated intensive surveys — bioblitzes — on ten days across 2019, 2020, 2024, and 2026. These events are the opposite of Thorpe's long-term record in almost every dimension: many observers instead of one, minutes to hours instead of years, breadth-seeking instead of depth-seeking.
+
+The largest event on record occurred on 24 March 2026 — the first major bioblitz at the campus since Thorpe's death — and produced 798 observations from 52 observers in a single day. Among those 63 participants, only 2 had any prior iNaturalist observations in the project: the rest signed up for the platform specifically for the event. This 3.2% return rate echoes across all four bioblitz years; in 2019, 2020, and 2024, the returning-observer rate was exactly 0%.
+
+This pattern — most participants appearing once and never returning — is well documented in the citizen science literature. Researchers distinguish between "superusers," the small fraction of highly active contributors who dominate any platform's output, and the large majority of casual or event-recruited participants who contribute briefly and lapse. Across all bioblitz events in this project, 152 of the 175 bioblitz participants — 86.9% — observed exclusively on bioblitz days and never returned. The two established iNaturalist users present at the 2026 event represent the superuser presence that makes the difference between a data spike and a lasting record.
+
+What does the bioblitz actually generate as lasting data? The research-grade rate tells part of the story. Bioblitz observations reach research grade at 33%, compared to 43.4% for non-bioblitz observations. The gap is not uniform across taxa: for birds — with abundant identifiers and clear photographic diagnostics — bioblitz records actually outperform routine observation (96.5% versus 90.5% research grade). For insects, the bioblitz rate drops to 51.2% against 65.1%. For fungi the deficit is severe: 12% research grade from the bioblitz versus 45.3% from routine observation. The bioblitz also added `r new_species_count` taxa recorded for the first time in the project — a genuine contribution, even if a large fraction of those records remain unidentified.
+
+The difference in who generates data, and how, makes this legible. A bioblitz surfaces what is detectable by a general observer in a short window: conspicuous organisms, accessible locations, taxa that photograph well. Thorpe's 14 years of sustained attention surfaced what a specialist notices when expertise runs deep: cryptic invertebrates, difficult identifications, the rare seasonal records that only accumulate over years. Neither is wrong. They are answers to different questions, and the 41% of bioblitz observations currently awaiting identification reflects the cost of generating data faster than the identification infrastructure can process it.
+
+## What the models do not capture
+
+<!-- TRIBUTE SIDEBAR -->
+<div class="sidebar-box">
+<h4>Fallen Tōtara — Community voice</h4>
+<div class="tribute-header">♥ × 125 &nbsp; 💬 × 85</div>
+<div class="tribute-count">Comments from 6 continents · Aug 2024 – May 2026</div>
+<div class="tribute-q">"Thank you for inspiring me. Thank you for challenging me. Thank you for guiding me."</div>
+<div class="tribute-attr">— @dave_holland</div>
+<div class="tribute-q">"You helped me see beauty in the mundane."</div>
+<div class="tribute-attr">— @mothshark</div>
+<div class="tribute-q">"Always happy and always able to help with identifications, always pointing towards the relevant literature."</div>
+<div class="tribute-attr">— @claasdamken, University of Auckland</div>
+<div class="tribute-q">"I will name after you a new species someday."</div>
+<div class="tribute-attr">— @tigerguo, April 2025</div>
+<div class="tribute-q">"I changed an ID based on an old comment of his just today."</div>
+<div class="tribute-attr">— @brendandoogan, February 2026</div>
+</div>
+
+The comment thread on Thorpe's last iNaturalist post extends nearly two years past his death. People continue to write. His identifications are still working. The species he named and the corrections he made to others' misidentifications remain in the database, still pulling records to research grade, still shaping what the platform knows. His name appears in observers' notification feeds — observer of record, identifier of record — for people who will never meet him.
+
+Murray Dawson, a botanist at Manaaki Whenua Landcare Research, created a project on iNaturalist NZ in his honour: the *Fallen Tōtara*. The name is well-chosen. *Podocarpus totara*, the tōtara, is one of New Zealand's great timber trees: long-lived, deep-rooted, difficult to replace. When one falls, the gap it leaves is both literal and ecological — a changed canopy, a redistribution of light, a slow process of succession toward whatever grows in the opening.
+
+Claus Damken, a researcher at the University of Auckland, wrote in the tribute thread: "You were always there when I found my way into the biology lab on Tāmaki Campus during my PhD. Always happy and always able to help with identifications, always pointing towards the relevant literature." That is a description of a mode of data production: a human infrastructure of expertise and generosity that transformed presence — a bug on a wall, a weevil on a hand — into a record that will outlast both the observer and the observed.
+
+## What we can say from what we have
+
+The devoted single-observer pattern turns out to be rare but real. Across six comparable bounded-site projects, three show the structural signature — R1/R2 above 5×, power-law excess above 4× — that marks a contributor who has crossed from "very active" into a qualitatively different mode of participation. These are not just enthusiastic hobbyists. They are the primary source of records for their projects, generating between 10% and 36% of all observations, providing the identification infrastructure that converts photographs into science, and building the kind of historical depth that no concentrated short-term event can replicate.
+
+The bioblitz is not a substitute for this. It is a different instrument: faster, broader, better at detecting conspicuous taxa, better at recruiting new observers into the platform ecosystem. Of those new observers, most will not return — but some will. The two established iNaturalist users who participated in the 2026 UoA bioblitz represent the conversion pathway from event-recruit to regular contributor that keeps a community project alive. Whether that pathway can eventually produce another Thorpe — someone who shows up, season after season, for a decade and a half — is a question no bioblitz can answer in a single morning.
+
+His last observation — the weevil, the afternoon light, the 3:51 pm upload — has 85 comments. It is the most-commented observation in the UoA Campus project. It is also the only one that will not be followed by another.
+
+</div><!-- end sig-body -->
+
+<div class="sig-footer">
+
+### Code & data availability
+
+All analysis code, the cleaned observation dataset, and figure-generation scripts are available at: [github.com/jwinchester/biosci-738-significance](https://github.com/jwinchester/biosci-738-significance). The raw iNaturalist data were retrieved via the iNaturalist API v1 and are freely accessible at [inaturalist.org](https://www.inaturalist.org/projects/biota-of-university-of-auckland-city-campus).
+
+### AI use statement
+
+Claude Code (Anthropic) was used throughout this project. In exploratory analysis, it identified Stephen Thorpe as a structural outlier in the observer distribution and, when asked for more information, located news reports and community records documenting his death — a discovery that shifted the article from a purely statistical piece into a human-interest story. It also surfaced the March 2026 bioblitz as a comparative data source — a connection the author would not otherwise have made. Claude Code fetched iNaturalist data via API calls and wrote and debugged the R code for the power-law fit to observer rank-abundance data and the cumulative taxon accumulation analysis. It also designed the HTML/CSS magazine layout and figure styling. All text and captions were written by the author. All analytical decisions — model selection, parameter interpretation, and statistical framing — were made and reviewed by the author.
+
+### Ethical considerations
+
+This analysis uses observation records contributed to iNaturalist under Creative Commons licences, with the explicit expectation of scientific and educational use. Observer usernames are displayed as observers chose on the public platform. No location data have been obscured or manipulated; the UoA City Campus project involves an urban, publicly accessible area. Comments cited from the tribute thread are public posts made on a public observation page by their authors. Stephen Thorpe is discussed as a matter of public scientific record; no personal information beyond what he and the iNaturalist community made public has been used. This study involved no collection of biological specimens, no human-subjects research, and no contact with living individuals beyond downloading public data.
+
+### References
+
+1. Di Cecco, G.J., V. Barve, M.W. Belitz, B.S. Jennings, W.J. Meiners, and A.H. Hurlbert. 2021. "Observing the Observers: How Participants Contribute Data to iNaturalist and Implications for Biodiversity Science." *BioScience* 71(10): 1179–1188.
+2. Isaac, N.J.B., S. Strien, T.A. August, M.P. de Zeeuw, and D.B. Roy. 2014. "Statistics for citizen science: Extracting signals of change from noisy ecological data." *Methods in Ecology and Evolution* 5(10): 1052–1060.
+3. iNaturalist. 2024. University of Auckland City Campus project. California Academy of Sciences. Accessed June 2026 via API v1.
+
+</div>
