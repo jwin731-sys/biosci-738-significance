@@ -19,3 +19,5 @@ bot-conversations/
 *.log
 CLAUDE.md
 STATUS.md
+scripts/
+figures/
