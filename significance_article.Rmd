@@ -594,7 +594,7 @@ His last observation — the weevil, the afternoon light, the 3:51 pm upload —
 
 ### Code & data availability
 
-All analysis code, the cleaned observation dataset, and figure-generation scripts are available at: [github.com/jwinchester/biosci-738-significance](https://github.com/jwinchester/biosci-738-significance). The raw iNaturalist data were retrieved via the iNaturalist API v1 and are freely accessible at [inaturalist.org](https://www.inaturalist.org/projects/biota-of-university-of-auckland-city-campus).
+All analysis code, the cleaned observation dataset, and figure-generation scripts are available at: [github.com/jwin731-sys/biosci-738-significance](https://github.com/jwin731-sys/biosci-738-significance). The raw iNaturalist data were retrieved via the iNaturalist API v1 and are freely accessible at [inaturalist.org](https://www.inaturalist.org/projects/biota-of-university-of-auckland-city-campus).
 
 ### AI use statement
 
